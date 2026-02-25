@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
@@ -7,9 +8,26 @@ using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using Mirage;
+using Mirage.Serialization;
 
 namespace SmokeTrail
 {
+    // ========== NETWORK MESSAGE ==========
+
+    public struct SmokeNetMessage
+    {
+        public uint netId;      // NetworkIdentity netId to identify aircraft
+        public bool active;     // smoke on/off
+        public float r, g, b;   // color
+        public float opacity;
+        public float size;
+        public float lifetime;
+        public float rate;
+    }
+
+    // ========== SMOKE STATE ==========
+
     public class SmokeTrailState
     {
         public Aircraft aircraft;
@@ -23,6 +41,8 @@ namespace SmokeTrail
         public float rate = 60f;
     }
 
+    // ========== SMOKE MANAGER ==========
+
     public static class SmokeManager
     {
         public static Dictionary<int, SmokeTrailState> states = new Dictionary<int, SmokeTrailState>();
@@ -34,14 +54,13 @@ namespace SmokeTrail
 
             s = new SmokeTrailState { aircraft = ac };
 
-            // Create smoke particle system on the aircraft
             s.smokeObj = new GameObject("SmokeTrail");
             s.smokeObj.transform.SetParent(ac.transform, false);
-            s.smokeObj.transform.localPosition = new Vector3(0, 0, -5f); // behind aircraft
+            s.smokeObj.transform.localPosition = new Vector3(0, 0, -5f);
 
             s.ps = s.smokeObj.AddComponent<ParticleSystem>();
             var emission = s.ps.emission;
-            emission.enabled = false; // start off
+            emission.enabled = false;
 
             var main = s.ps.main;
             main.startLifetime = s.lifetime;
@@ -53,13 +72,11 @@ namespace SmokeTrail
             main.maxParticles = 5000;
             main.gravityModifier = 0f;
 
-            // Size over lifetime — grow slightly
             var sol = s.ps.sizeOverLifetime;
             sol.enabled = true;
             sol.size = new ParticleSystem.MinMaxCurve(1f, new AnimationCurve(
                 new Keyframe(0f, 0.5f), new Keyframe(0.3f, 1f), new Keyframe(1f, 1.5f)));
 
-            // Color over lifetime — fade out
             var col = s.ps.colorOverLifetime;
             col.enabled = true;
             var gradient = new Gradient();
@@ -68,7 +85,6 @@ namespace SmokeTrail
                 new GradientAlphaKey[] { new GradientAlphaKey(1f, 0f), new GradientAlphaKey(0.6f, 0.5f), new GradientAlphaKey(0f, 1f) });
             col.color = gradient;
 
-            // Renderer — use procedural soft circle texture
             var renderer = s.smokeObj.GetComponent<ParticleSystemRenderer>();
             renderer.renderMode = ParticleSystemRenderMode.Billboard;
             renderer.material = CreateSmokeMaterial();
@@ -100,12 +116,61 @@ namespace SmokeTrail
             if (s.active) emission.rateOverTime = s.rate;
         }
 
+        public static void ApplyNetMessage(SmokeNetMessage msg)
+        {
+            // Find aircraft by NetworkIdentity netId
+            var aircraft = FindAircraftByNetId(msg.netId);
+            if (aircraft == null) return;
+
+            var state = GetOrCreate(aircraft);
+            state.color = new Color(msg.r, msg.g, msg.b);
+            state.opacity = msg.opacity;
+            state.size = msg.size;
+            state.lifetime = msg.lifetime;
+            state.rate = msg.rate;
+            UpdateSettings(state);
+            SetActive(state, msg.active);
+        }
+
+        public static Aircraft FindAircraftByNetId(uint netId)
+        {
+            foreach (var ac in UnityEngine.Object.FindObjectsOfType<Aircraft>())
+            {
+                if (ac == null || ac.disabled) continue;
+                var ni = ac.GetComponent<NetworkIdentity>();
+                if (ni != null && ni.NetId == netId)
+                    return ac;
+            }
+            return null;
+        }
+
+        public static uint GetNetId(Aircraft ac)
+        {
+            var ni = ac.GetComponent<NetworkIdentity>();
+            return ni != null ? ni.NetId : 0;
+        }
+
+        public static SmokeNetMessage StateToMessage(SmokeTrailState s)
+        {
+            return new SmokeNetMessage
+            {
+                netId = GetNetId(s.aircraft),
+                active = s.active,
+                r = s.color.r,
+                g = s.color.g,
+                b = s.color.b,
+                opacity = s.opacity,
+                size = s.size,
+                lifetime = s.lifetime,
+                rate = s.rate
+            };
+        }
+
         private static Material cachedSmokeMat;
         private static Material CreateSmokeMaterial()
         {
             if (cachedSmokeMat != null) return cachedSmokeMat;
 
-            // Create soft circle texture procedurally
             int size = 64;
             var tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
             float center = size / 2f;
@@ -114,13 +179,12 @@ namespace SmokeTrail
                 for (int x = 0; x < size; x++)
                 {
                     float dist = Vector2.Distance(new Vector2(x, y), new Vector2(center, center)) / center;
-                    float alpha = Mathf.Clamp01(1f - dist * dist); // soft falloff
+                    float alpha = Mathf.Clamp01(1f - dist * dist);
                     tex.SetPixel(x, y, new Color(1f, 1f, 1f, alpha));
                 }
             }
             tex.Apply();
 
-            // Find a working shader
             Shader sh = Shader.Find("Universal Render Pipeline/Particles/Unlit")
                 ?? Shader.Find("Particles/Standard Unlit")
                 ?? Shader.Find("Legacy Shaders/Particles/Alpha Blended")
@@ -128,7 +192,6 @@ namespace SmokeTrail
 
             if (sh == null)
             {
-                // Last resort: grab shader from any existing particle renderer
                 foreach (var psr in UnityEngine.Object.FindObjectsOfType<ParticleSystemRenderer>())
                 {
                     if (psr.material != null && psr.material.shader != null)
@@ -141,11 +204,10 @@ namespace SmokeTrail
 
             var mat = new Material(sh);
             mat.mainTexture = tex;
-            // Try to set alpha blending
             try
             {
-                mat.SetFloat("_Surface", 1); // URP: 0=Opaque, 1=Transparent
-                mat.SetFloat("_Blend", 0);   // URP: 0=Alpha, 1=Premultiply, 2=Additive, 3=Multiply
+                mat.SetFloat("_Surface", 1);
+                mat.SetFloat("_Blend", 0);
                 mat.SetOverrideTag("RenderType", "Transparent");
                 mat.renderQueue = 3000;
                 mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
@@ -173,14 +235,185 @@ namespace SmokeTrail
         }
     }
 
+    // ========== NETWORK MANAGER ==========
+
+    public static class SmokeNetwork
+    {
+        private static bool registered;
+        private static NetworkServer cachedServer;
+        private static NetworkClient cachedClient;
+
+        public static bool IsMultiplayer => cachedServer != null || cachedClient != null;
+        public static bool IsServer => cachedServer != null && cachedServer.Active;
+
+        public static void Initialize()
+        {
+            if (registered) return;
+
+            try
+            {
+                // Register custom serializer for SmokeNetMessage
+                RegisterSerializers();
+                registered = true;
+                Plugin.Log?.LogInfo("SmokeNetwork serializers registered");
+            }
+            catch (Exception e)
+            {
+                Plugin.Log?.LogError($"SmokeNetwork init failed: {e}");
+            }
+        }
+
+        private static void RegisterSerializers()
+        {
+            // Use reflection to set Writer<SmokeNetMessage>.Write and Reader<SmokeNetMessage>.Read
+            var writerType = typeof(Writer<>).MakeGenericType(typeof(SmokeNetMessage));
+            var writerProp = writerType.GetProperty("Write", BindingFlags.Public | BindingFlags.Static);
+            if (writerProp == null)
+                writerProp = writerType.GetProperty("Write", BindingFlags.NonPublic | BindingFlags.Static);
+
+            // Try field directly if property setter fails
+            var writerField = writerType.GetField("<Write>k__BackingField", BindingFlags.NonPublic | BindingFlags.Static);
+
+            Action<NetworkWriter, SmokeNetMessage> writeFunc = (writer, msg) =>
+            {
+                writer.WriteUInt32(msg.netId);
+                writer.WriteBoolean(msg.active);
+                writer.WriteSingle(msg.r);
+                writer.WriteSingle(msg.g);
+                writer.WriteSingle(msg.b);
+                writer.WriteSingle(msg.opacity);
+                writer.WriteSingle(msg.size);
+                writer.WriteSingle(msg.lifetime);
+                writer.WriteSingle(msg.rate);
+            };
+
+            if (writerProp != null && writerProp.CanWrite)
+                writerProp.SetValue(null, writeFunc);
+            else if (writerField != null)
+                writerField.SetValue(null, writeFunc);
+            else
+                Plugin.Log?.LogWarning("Could not register Writer<SmokeNetMessage>");
+
+            var readerType = typeof(Reader<>).MakeGenericType(typeof(SmokeNetMessage));
+            var readerProp = readerType.GetProperty("Read", BindingFlags.Public | BindingFlags.Static);
+            if (readerProp == null)
+                readerProp = readerType.GetProperty("Read", BindingFlags.NonPublic | BindingFlags.Static);
+
+            var readerField = readerType.GetField("<Read>k__BackingField", BindingFlags.NonPublic | BindingFlags.Static);
+
+            Func<NetworkReader, SmokeNetMessage> readFunc = (reader) =>
+            {
+                return new SmokeNetMessage
+                {
+                    netId = reader.ReadUInt32(),
+                    active = reader.ReadBoolean(),
+                    r = reader.ReadSingle(),
+                    g = reader.ReadSingle(),
+                    b = reader.ReadSingle(),
+                    opacity = reader.ReadSingle(),
+                    size = reader.ReadSingle(),
+                    lifetime = reader.ReadSingle(),
+                    rate = reader.ReadSingle()
+                };
+            };
+
+            if (readerProp != null && readerProp.CanWrite)
+                readerProp.SetValue(null, readFunc);
+            else if (readerField != null)
+                readerField.SetValue(null, readFunc);
+            else
+                Plugin.Log?.LogWarning("Could not register Reader<SmokeNetMessage>");
+        }
+
+        public static void TryFindNetwork()
+        {
+            if (cachedServer == null)
+                cachedServer = UnityEngine.Object.FindObjectOfType<NetworkServer>();
+            if (cachedClient == null)
+                cachedClient = UnityEngine.Object.FindObjectOfType<NetworkClient>();
+        }
+
+        public static void RegisterClientHandler()
+        {
+            if (cachedClient == null) return;
+            try
+            {
+                var handler = cachedClient.MessageHandler;
+                if (handler == null) return;
+
+                // RegisterHandler<SmokeNetMessage>(callback, allowUnauthenticated: true)
+                var method = handler.GetType().GetMethod("RegisterHandler");
+                if (method == null) return;
+
+                var genericMethod = method.MakeGenericMethod(typeof(SmokeNetMessage));
+
+                // Create the delegate: MessageDelegateWithPlayer<SmokeNetMessage>
+                // which is Action<INetworkPlayer, SmokeNetMessage>
+                var delegateType = typeof(MessageDelegateWithPlayer<>).MakeGenericType(typeof(SmokeNetMessage));
+
+                var callbackMethod = typeof(SmokeNetwork).GetMethod(nameof(OnClientReceiveSmoke),
+                    BindingFlags.Public | BindingFlags.Static);
+
+                var del = Delegate.CreateDelegate(delegateType, callbackMethod);
+                genericMethod.Invoke(handler, new object[] { del, true });
+
+                Plugin.Log?.LogInfo("Client handler registered for SmokeNetMessage");
+            }
+            catch (Exception e)
+            {
+                Plugin.Log?.LogError($"RegisterClientHandler failed: {e}");
+            }
+        }
+
+        public static void OnClientReceiveSmoke(INetworkPlayer player, SmokeNetMessage msg)
+        {
+            try
+            {
+                SmokeManager.ApplyNetMessage(msg);
+            }
+            catch (Exception e)
+            {
+                Plugin.Log?.LogError($"OnClientReceiveSmoke error: {e}");
+            }
+        }
+
+        public static void SendToAll(SmokeNetMessage msg)
+        {
+            if (cachedServer == null || !cachedServer.Active) return;
+            try
+            {
+                // NetworkServer.SendToAll<SmokeNetMessage>(msg, false, Channel.Reliable)
+                var method = cachedServer.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .Where(m => m.Name == "SendToAll" && m.IsGenericMethod && m.GetParameters().Length == 3)
+                    .FirstOrDefault();
+
+                if (method == null) return;
+
+                var genericMethod = method.MakeGenericMethod(typeof(SmokeNetMessage));
+                genericMethod.Invoke(cachedServer, new object[] { msg, false, Channel.Reliable });
+            }
+            catch (Exception e)
+            {
+                Plugin.Log?.LogError($"SendToAll failed: {e}");
+            }
+        }
+
+        public static void OnSceneChange()
+        {
+            cachedServer = null;
+            cachedClient = null;
+        }
+    }
+
+    // ========== UI ==========
+
     public class SmokeTrailUI
     {
         private bool visible;
-        private Rect windowRect = new Rect(20, 20, 340, 500);
+        private Rect windowRect = new Rect(20, 20, 340, 520);
         private int windowId = 94712;
         private Vector2 scrollPos;
 
-        // Color presets
         private static readonly (string name, Color color)[] presets = new[]
         {
             ("White", Color.white),
@@ -198,6 +431,8 @@ namespace SmokeTrail
         private bool stylesInit;
         private Texture2D previewTex;
         private GUIStyle previewStyle;
+
+        private bool networkSetup;
 
         private void InitStyles()
         {
@@ -218,13 +453,40 @@ namespace SmokeTrail
         {
             if (Input.GetKeyDown(KeyCode.F7))
                 visible = !visible;
+
+            // F8 = quick toggle smoke on current aircraft
+            if (Input.GetKeyDown(KeyCode.F8))
+            {
+                try
+                {
+                    var localAc = FindLocalAircraft();
+                    if (localAc != null)
+                    {
+                        var state = SmokeManager.GetOrCreate(localAc);
+                        SmokeManager.SetActive(state, !state.active);
+                        BroadcastState(state);
+                    }
+                }
+                catch { }
+            }
+
+            // Try to setup network once
+            if (!networkSetup)
+            {
+                SmokeNetwork.TryFindNetwork();
+                if (SmokeNetwork.IsMultiplayer)
+                {
+                    SmokeNetwork.RegisterClientHandler();
+                    networkSetup = true;
+                }
+            }
         }
 
         public void OnGUI()
         {
             if (!visible) return;
             InitStyles();
-            windowRect = GUILayout.Window(windowId, windowRect, DrawWindow, "Smoke Trail v1.0.0");
+            windowRect = GUILayout.Window(windowId, windowRect, DrawWindow, "Smoke Trail v2.0.0");
         }
 
         private Aircraft selectedAircraft;
@@ -233,7 +495,6 @@ namespace SmokeTrail
         {
             try
             {
-            // Aircraft list
             var allAircraft = UnityEngine.Object.FindObjectsOfType<Aircraft>();
             var aiList = new List<(Aircraft ac, string name)>();
 
@@ -256,7 +517,17 @@ namespace SmokeTrail
             }
 
             GUILayout.Label("Smoke Trail", headerStyle);
-            GUILayout.Label("F7 to toggle | Select aircraft, toggle smoke", wpLabelStyle);
+
+            // Network status
+            if (SmokeNetwork.IsMultiplayer)
+            {
+                string role = SmokeNetwork.IsServer ? "HOST" : "CLIENT";
+                GUILayout.Label($"F7 to toggle | Multiplayer: {role}", wpLabelStyle);
+            }
+            else
+            {
+                GUILayout.Label("F7 to toggle | Singleplayer", wpLabelStyle);
+            }
             GUILayout.Space(4);
 
             // Aircraft scroll
@@ -297,6 +568,7 @@ namespace SmokeTrail
                     state.active ? activeButtonStyle : buttonStyle, GUILayout.Height(30)))
                 {
                     SmokeManager.SetActive(state, !state.active);
+                    BroadcastState(state);
                 }
                 GUILayout.EndHorizontal();
 
@@ -318,6 +590,7 @@ namespace SmokeTrail
                     {
                         state.color = pcolor;
                         SmokeManager.UpdateSettings(state);
+                        BroadcastState(state);
                     }
                     count++;
                     if (count % 5 == 0) { GUILayout.EndHorizontal(); GUILayout.BeginHorizontal(); }
@@ -337,9 +610,10 @@ namespace SmokeTrail
                 {
                     state.color = new Color(r, g, b);
                     SmokeManager.UpdateSettings(state);
+                    BroadcastState(state);
                 }
 
-                // Color preview using 1x1 texture
+                // Color preview
                 if (previewTex == null)
                 {
                     previewTex = new Texture2D(1, 1);
@@ -354,19 +628,32 @@ namespace SmokeTrail
 
                 // Sliders
                 GUILayout.Label($"Opacity: {state.opacity:F1}", wpLabelStyle);
-                state.opacity = GUILayout.HorizontalSlider(state.opacity, 0.1f, 1f);
+                float newOpacity = GUILayout.HorizontalSlider(state.opacity, 0.1f, 1f);
 
                 GUILayout.Label($"Size: {state.size:F0}", wpLabelStyle);
-                state.size = GUILayout.HorizontalSlider(state.size, 1f, 30f);
+                float newSize = GUILayout.HorizontalSlider(state.size, 1f, 30f);
 
                 GUILayout.Label($"Lifetime: {state.lifetime:F1}s", wpLabelStyle);
-                state.lifetime = GUILayout.HorizontalSlider(state.lifetime, 1f, 20f);
+                float newLifetime = GUILayout.HorizontalSlider(state.lifetime, 1f, 20f);
 
                 GUILayout.Label($"Rate: {state.rate:F0}/s", wpLabelStyle);
-                state.rate = GUILayout.HorizontalSlider(state.rate, 10f, 200f);
+                float newRate = GUILayout.HorizontalSlider(state.rate, 10f, 200f);
 
-                if (GUI.changed)
+                bool sliderChanged = false;
+                if (newOpacity != state.opacity || newSize != state.size || newLifetime != state.lifetime || newRate != state.rate)
+                {
+                    state.opacity = newOpacity;
+                    state.size = newSize;
+                    state.lifetime = newLifetime;
+                    state.rate = newRate;
+                    sliderChanged = true;
+                }
+
+                if (sliderChanged || GUI.changed)
+                {
                     SmokeManager.UpdateSettings(state);
+                    BroadcastState(state);
+                }
 
                 GUILayout.Space(4);
 
@@ -378,12 +665,16 @@ namespace SmokeTrail
                     {
                         var s = SmokeManager.GetOrCreate(item.ac);
                         SmokeManager.SetActive(s, true);
+                        BroadcastState(s);
                     }
                 }
                 if (GUILayout.Button("All OFF", smallButtonStyle))
                 {
                     foreach (var kv in SmokeManager.states)
+                    {
                         SmokeManager.SetActive(kv.Value, false);
+                        BroadcastState(kv.Value);
+                    }
                 }
                 GUILayout.EndHorizontal();
             }
@@ -394,6 +685,27 @@ namespace SmokeTrail
                 GUILayout.Label($"Error: {e.Message}", wpLabelStyle);
             }
             GUI.DragWindow();
+        }
+
+        private void BroadcastState(SmokeTrailState state)
+        {
+            if (!SmokeNetwork.IsServer) return;
+            if (state.aircraft == null) return;
+
+            var msg = SmokeManager.StateToMessage(state);
+            if (msg.netId == 0) return; // no network identity (singleplayer or not spawned)
+
+            SmokeNetwork.SendToAll(msg);
+        }
+
+        private Aircraft FindLocalAircraft()
+        {
+            foreach (var ac in UnityEngine.Object.FindObjectsOfType<Aircraft>())
+            {
+                if (ac == null || ac.disabled) continue;
+                if (GameManager.IsLocalAircraft(ac)) return ac;
+            }
+            return null;
         }
 
         private static bool ColorClose(Color a, Color b) =>
@@ -415,7 +727,6 @@ namespace SmokeTrail
             Plugin.Log?.LogInfo("FrameHelper Awake OK");
         }
 
-
         void Update()
         {
             ui.HandleInput();
@@ -435,7 +746,7 @@ namespace SmokeTrail
 
     // ========== PLUGIN ==========
 
-    [BepInPlugin("com.noms.smoketrail", "Smoke Trail", "1.0.0")]
+    [BepInPlugin("com.noms.smoketrail", "Smoke Trail", "2.0.0")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
@@ -445,12 +756,18 @@ namespace SmokeTrail
         private void Awake()
         {
             Log = Logger;
-            Logger.LogInfo("Smoke Trail v1.0.0 loaded");
+            Logger.LogInfo("Smoke Trail v2.0.0 loaded");
+
+            // Initialize network serializers early
+            SmokeNetwork.Initialize();
+
             SceneManager.sceneLoaded += OnSceneLoaded;
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
+            SmokeNetwork.OnSceneChange();
+
             if (helperCreated && FrameHelper.Instance != null) return;
             var go = new GameObject("SmokeTrail_Helper");
             UnityEngine.Object.DontDestroyOnLoad(go);
