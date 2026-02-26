@@ -433,6 +433,12 @@ namespace SmokeTrail
         private GUIStyle previewStyle;
 
         private bool networkSetup;
+        private string bindingTarget; // null, "UI", or "Smoke"
+        private float bindingTimer;
+        private float postBindCooldown;
+        private float uiToggleCooldown;
+        private float smokeToggleCooldown;
+        private HashSet<KeyCode> keysHeldAtBindStart = new HashSet<KeyCode>();
 
         private void InitStyles()
         {
@@ -451,11 +457,45 @@ namespace SmokeTrail
 
         public void HandleInput()
         {
-            if (Input.GetKeyDown(KeyCode.F7))
-                visible = !visible;
+            // Key binding capture mode
+            if (bindingTarget != null)
+            {
+                bindingTimer += Time.deltaTime;
+                if (Input.GetKeyDown(KeyCode.Escape))
+                {
+                    bindingTarget = null;
+                    bindingTimer = 0f;
+                }
+                else if (bindingTimer > 0.3f && Input.anyKeyDown)
+                {
+                    var pressed = GetPressedKey(keysHeldAtBindStart);
+                    if (pressed != KeyCode.None)
+                    {
+                        if (bindingTarget == "UI")    Plugin.KeyToggleUI.Value    = pressed;
+                        if (bindingTarget == "Smoke") Plugin.KeyToggleSmoke.Value = pressed;
+                        bindingTarget = null;
+                        bindingTimer = 0f;
+                        postBindCooldown = 0.3f;
+                        keysHeldAtBindStart.Clear();
+                    }
+                }
+                return; // don't process normal input while binding
+            }
 
-            // F8 = quick toggle smoke on current aircraft
-            if (Input.GetKeyDown(KeyCode.F8))
+            postBindCooldown -= Time.deltaTime;
+            if (postBindCooldown > 0f) return;
+
+            uiToggleCooldown -= Time.deltaTime;
+            smokeToggleCooldown -= Time.deltaTime;
+
+            if (Input.GetKeyDown(Plugin.KeyToggleUI.Value) && uiToggleCooldown <= 0f)
+            {
+                visible = !visible;
+                uiToggleCooldown = 0.5f;
+            }
+
+            // Quick toggle smoke on current aircraft
+            if (Input.GetKeyDown(Plugin.KeyToggleSmoke.Value) && smokeToggleCooldown <= 0f)
             {
                 try
                 {
@@ -465,6 +505,7 @@ namespace SmokeTrail
                         var state = SmokeManager.GetOrCreate(localAc);
                         SmokeManager.SetActive(state, !state.active);
                         BroadcastState(state);
+                        smokeToggleCooldown = 0.5f;
                     }
                 }
                 catch { }
@@ -482,11 +523,34 @@ namespace SmokeTrail
             }
         }
 
+        private void SnapshotHeldKeys()
+        {
+            keysHeldAtBindStart.Clear();
+            foreach (KeyCode kc in System.Enum.GetValues(typeof(KeyCode)))
+            {
+                if (kc == KeyCode.None) continue;
+                if (kc >= KeyCode.Mouse0 && kc <= KeyCode.Mouse6) continue;
+                try { if (Input.GetKey(kc)) keysHeldAtBindStart.Add(kc); } catch { }
+            }
+        }
+
+        private static KeyCode GetPressedKey(HashSet<KeyCode> exclude)
+        {
+            foreach (KeyCode kc in System.Enum.GetValues(typeof(KeyCode)))
+            {
+                if (kc == KeyCode.None) continue;
+                if (kc >= KeyCode.Mouse0 && kc <= KeyCode.Mouse6) continue;
+                if (exclude.Contains(kc)) continue; // 바인딩 시작 시 이미 눌려있던 키 제외
+                if (Input.GetKeyDown(kc)) return kc;
+            }
+            return KeyCode.None;
+        }
+
         public void OnGUI()
         {
             if (!visible) return;
             InitStyles();
-            windowRect = GUILayout.Window(windowId, windowRect, DrawWindow, "Smoke Trail v2.0.0");
+            windowRect = GUILayout.Window(windowId, windowRect, DrawWindow, "Smoke Trail v2.1.0");
         }
 
         private Aircraft selectedAircraft;
@@ -522,11 +586,33 @@ namespace SmokeTrail
             if (SmokeNetwork.IsMultiplayer)
             {
                 string role = SmokeNetwork.IsServer ? "HOST" : "CLIENT";
-                GUILayout.Label($"F7 to toggle | Multiplayer: {role}", wpLabelStyle);
+                GUILayout.Label($"Multiplayer: {role}", wpLabelStyle);
             }
             else
             {
-                GUILayout.Label("F7 to toggle | Singleplayer", wpLabelStyle);
+                GUILayout.Label("Singleplayer", wpLabelStyle);
+            }
+            GUILayout.Space(4);
+
+            // Keybinds section
+            GUILayout.Label("Keybinds", labelStyle);
+            if (bindingTarget != null)
+            {
+                GUILayout.Label("Press any key or HOTAS button... (ESC to cancel)", wpLabelStyle);
+            }
+            else
+            {
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Toggle UI:", wpLabelStyle, GUILayout.Width(80));
+                if (GUILayout.Button(Plugin.KeyToggleUI.Value.ToString(), smallButtonStyle, GUILayout.Width(120)))
+                { bindingTarget = "UI"; bindingTimer = 0f; SnapshotHeldKeys(); }
+                GUILayout.EndHorizontal();
+
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Toggle Smoke:", wpLabelStyle, GUILayout.Width(80));
+                if (GUILayout.Button(Plugin.KeyToggleSmoke.Value.ToString(), smallButtonStyle, GUILayout.Width(120)))
+                { bindingTarget = "Smoke"; bindingTimer = 0f; SnapshotHeldKeys(); }
+                GUILayout.EndHorizontal();
             }
             GUILayout.Space(4);
 
@@ -746,17 +832,24 @@ namespace SmokeTrail
 
     // ========== PLUGIN ==========
 
-    [BepInPlugin("com.noms.smoketrail", "Smoke Trail", "2.0.0")]
+    [BepInPlugin("com.noms.smoketrail", "Smoke Trail", "2.1.0")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
+        internal static ConfigEntry<KeyCode> KeyToggleUI;
+        internal static ConfigEntry<KeyCode> KeyToggleSmoke;
 
         private static bool helperCreated;
 
         private void Awake()
         {
             Log = Logger;
-            Logger.LogInfo("Smoke Trail v2.0.0 loaded");
+            Logger.LogInfo("Smoke Trail v2.1.0 loaded");
+
+            KeyToggleUI = Config.Bind("Keybinds", "ToggleUI", KeyCode.F7,
+                "Key to open/close the Smoke Trail UI. Supports keyboard keys and HOTAS joystick buttons (e.g. JoystickButton0).");
+            KeyToggleSmoke = Config.Bind("Keybinds", "ToggleSmoke", KeyCode.F8,
+                "Key to quickly toggle smoke on your aircraft. Supports keyboard keys and HOTAS joystick buttons (e.g. JoystickButton1).");
 
             // Initialize network serializers early
             SmokeNetwork.Initialize();
